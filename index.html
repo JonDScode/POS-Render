@@ -26,7 +26,8 @@ import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 const P = {
   ancho: 15, fondo: 12, cocina: 3, ventana: 2.4, alturaRiel: 2.6,
   filas: 3, columnas: 4, mesa: 1.1,
-  paso: 1.0, vCadena: 0.3, mCarro: 3, mCadena: 2, friccion: 0.03, rapidez: 5,
+  // valores de catálogo de un transportador de perfil cerrado: colgantes cada 152,4 mm (aquí 6 pasos), cadena de 4,9 kg/m, fricción del 2,5 %
+  paso: 0.9144, vCadena: 0.3, mCarro: 3.5, mCadena: 4.9, friccion: 0.025, rapidez: 5,
   duracion: 15, 'grabar video': record,
 };
 // resultados de física que el panel muestra (los rellena physics())
@@ -38,11 +39,12 @@ const hint = document.getElementById('hint');
 const SKIN = 0xffd500, RAIL = 0x444b55, FLOOR = 0xe4cd9e, TEAL = 0x1d9e75;
 const COLORS = [0xc91a09, 0x0055bf, 0x237841, 0xfe8a18, 0x078bc9, 0x923978, 0xf4f4f4, 0x1b2a34];
 // RC: radio de las curvas de la cadena · VZ: velocidad de bajada del brazo · WFAST: giro del rotor en vacío (rad/s)
-const RC = 0.5, VZ = 0.25, WFAST = 1;
+// RC es la curva de catálogo de 18" · T_FRENO: segundos en que el rotor frena o arranca con el plato, para no derramar
+const RC = 0.457, VZ = 0.25, WFAST = 1, T_FRENO = 1.5;
 // cotas que salen del CAD (cad/rotor.py y cad/carro.py), en metros y kg: si cambian allí, se cambian aquí
 // PIN: riel → pasador superior del carro · IZADO: lo que sube el carro al pasar al gancho · TRAY: pasador → base de la bandeja
 // PLATE: riel → placa de techo del rotor · M_PUNTA: plataforma + polipasto en la punta del brazo
-const PIN = 0.136, IZADO = 0.02, TRAY = 0.357, PLATE = 0.1935, M_PUNTA = 3.84;
+const PIN = 0.136, IZADO = 0.02, TRAY = 0.355, PLATE = 0.1935, M_PUNTA = 4.04;
 // AK: brazo de los rotores de cocina · T_CARGA: segundos que el carro pasa en el mesón mientras lo cargan o lo vacían
 const AK = 0.5, T_CARGA = 6;
 
@@ -233,14 +235,14 @@ function build() {
     box(0.06, 0.06, 0.1, DARK, a - 0.34, -0.06, 0.09, arm);                 // motorreductor
     const plat = new THREE.Group(); arm.add(plat);                          // plataforma: baja colgada de las 4 cintas
     box(0.385, 0.016, 0.07, TEAL, a - 0.1475, 0, 0, plat);                  // placa con el gancho en la punta
-    box(0.06, 0.03, 0.07, RAIL, a - 0.31, -0.023, 0, plat);                 // contrapeso
+    box(0.073, 0.03, 0.07, RAIL, a - 0.31, -0.023, 0, plat);                // contrapeso
     for (const gx of [a - 0.14, a - 0.25]) cyl(0.006, 0.1, RAIL, gx, 0.058, 0, plat); // columnas guía
     const belts = [a - 0.32, a - 0.07].flatMap(bx => [-0.03, 0.03].map(bz => box(0.002, 1, 0.01, 0xf2cd37, bx, 0, bz, arm)));
     // beta0: ángulo del brazo al tocar la cadena · sigma: sentido de giro para que el gancho vaya con la cadena
     // sGo / sBack: por dónde debe ir el enganche cuando el rotor arranca para tomar (1/4 de vuelta) o devolver (1/2 vuelta)
     const sPick = zrun < 0 ? sOnA(x) : sOnB(x);
     const r = { kind, table, cx: x, cz, a, arm, plat, belts, beta0: u * hp, sigma: -u * dir, sPick,
-      sGo: wrap(sPick - a * hp), sBack: wrap(sPick - a * Math.PI), depth: H - PIN + IZADO - TRAY - top, // depth: cuánto baja el polipasto
+      sGo: wrap(sPick - a * hp), sBack: wrap(sPick - a * Math.PI - P.vCadena * T_FRENO / 2), depth: H - PIN + IZADO - TRAY - top, // depth: cuánto baja el polipasto
       psi: 0, drop: 0, timer: 0, state: 'idle', carrier: null, k: 0 };
     rotors.push(r);
     return r;
@@ -286,13 +288,13 @@ function build() {
     const INOX = 0xc0c4cc, NAR = 0xfe8a18;
     cyl(0.006, 0.156, INOX, 0, -0.072, 0, g);
     for (const y of [0, -0.09]) cyl(0.006, 0.08, INOX, 0, y, 0, g).rotation.z = hp; // pasadores: a lo largo de x local
-    box(0.025, 0.005, 0.296, NAR, 0, -0.1525, 0, g);
-    for (const z of [-0.1455, 0.1455]) box(0.025, 0.2, 0.005, NAR, 0, -0.255, z, g);
-    box(0.3, 0.002, 0.3, NAR, 0, -TRAY + 0.001, 0, g);
+    box(0.025, 0.004, 0.298, NAR, 0, -0.152, 0, g);
+    for (const z of [-0.147, 0.147]) box(0.025, 0.2, 0.004, NAR, 0, -0.254, z, g);
+    box(0.3, 0.001, 0.3, NAR, 0, -TRAY + 0.0005, 0, g);
     for (const [w, d, x, z] of [[0.3, 0.002, 0, 0.149], [0.3, 0.002, 0, -0.149], [0.002, 0.3, 0.149, 0], [0.002, 0.3, -0.149, 0]])
       box(w, 0.015, d, NAR, x, -TRAY + 0.0075, z, g);
     const car = { g, dish: dish(rnd, g), table: null };
-    car.dish.position.y = -TRAY - 0.018; // el plato apoya en el fondo de la bandeja
+    car.dish.position.y = -TRAY - 0.019; // el plato apoya en el fondo de la bandeja
     setCarrier(car, 'free');
     slots[Math.floor(i * N / tables.length)].carrier = car;
     return car;
@@ -319,7 +321,7 @@ function physics() {
     'motor sugerido (W)': (2 * F * v / 0.7).toFixed(0),          // rendimiento 0,7 y margen ×2
     'vuelta completa (s)': (chain.len / v).toFixed(0),
     'rotor (rpm)': (v / a * 60 / (2 * Math.PI)).toFixed(1),       // el gancho debe ir a la velocidad de la cadena: ω = v / a
-    'media vuelta rotor (s)': (Math.PI * a / v).toFixed(1),
+    'media vuelta rotor (s)': (Math.PI * a / v + T_FRENO / 2).toFixed(1), // al paso de la cadena, más lo que añade frenar suave
     'par en eje rotor (N·m)': (((P.mCarro + M_PUNTA) * a + 0.76 * a * a) * 9.81).toFixed(0), // carro + plataforma + polipasto en la punta, y el tubo (1,52 kg/m)
     'holgura entre rotores (m)': (L.dx - 2 * a - 0.33).toFixed(2), // negativa = dos bandejas vecinas se tocarían al girar
     'bandeja viaja a (m)': (L.H - PIN - TRAY).toFixed(2),          // por debajo de 2 m pasaría a la altura de las cabezas
@@ -327,7 +329,7 @@ function physics() {
     'placa del rotor a (m)': (L.H + PLATE).toFixed(2),             // altura libre mínima del local
     // ciclo de un rotor de cocina: media vuelta de ida y otra de vuelta al paso de la cadena, bajar y subir, la carga,
     // volver vacío a su espera y, de media, un enganche hasta que pasa un hueco libre
-    'cocina: platos/h por estación': (3600 / (2 * Math.PI * AK / v + 2 * L.load.depth / VZ + T_CARGA + 1.5 * Math.PI / WFAST + chain.pitch / v)).toFixed(0),
+    'cocina: platos/h por estación': (3600 / (2 * Math.PI * AK / v + T_FRENO + 2 * L.load.depth / VZ + T_CARGA + 1.5 * Math.PI / WFAST + chain.pitch / v)).toFixed(0),
   });
 }
 
@@ -373,15 +375,20 @@ function stepRotor(r, dt) {
   if (r.state === 'meet' || r.state === 'return') {
     // leva electrónica: el ángulo va esclavo de la cadena, así gancho y enganche llegan a la vez y a la misma velocidad
     const d = toPick(), at = r.state === 'meet' ? PI / 2 : 2.5 * PI;
-    if (d < chain.len / 2) r.psi = at - d / r.a;
+    if (d < chain.len / 2) {
+      // la devolución arranca con plato: acelera de 0 a la velocidad de la cadena en T_FRENO, por eso sale medio T_FRENO antes
+      const vT = P.vCadena * T_FRENO, e = r.a * PI + vT / 2 - d; // e: lo que ha avanzado la cadena desde el arranque
+      r.psi = r.state === 'meet' ? at - d / r.a : at - PI + (e < vT ? e * e / (2 * vT) : e - vT / 2) / r.a;
+    }
     else if (r.state === 'meet') { // toma: el carro pasa de la cadena al gancho
       r.psi = at; r.carrier = slots[r.k].carrier; slots[r.k].carrier = null; r.state = 'swing';
     } else {                       // devolución: el carro vuelve a la cadena con el plato sucio
       r.psi = at; Object.assign(slots[r.k], { carrier: r.carrier, reserved: false }); r.carrier = null; r.state = 'park';
       if (t) Object.assign(t, { state: 'idle', timer: 15 + Math.random() * 25 });
     }
-  } else if (r.state === 'swing') { // media vuelta hasta quedar sobre la mesa
-    r.psi = Math.min(r.psi + P.vCadena / r.a * dt, 1.5 * PI);
+  } else if (r.state === 'swing') { // media vuelta hasta quedar sobre la mesa, frenando en T_FRENO al llegar
+    const w = P.vCadena / r.a, rem = 1.5 * PI - r.psi;
+    r.psi = Math.min(r.psi + Math.min(w, Math.sqrt(2 * w / T_FRENO * rem) + 0.02) * dt, 1.5 * PI);
     if (r.psi === 1.5 * PI) r.state = 'lower';
   } else if (r.state === 'lower') {
     r.drop = Math.min(r.drop + VZ * dt, r.depth);
@@ -444,8 +451,8 @@ const gui = new GUI({ title: 'Medidas (m)' });
 for (const [k, a, b, s] of [['ancho', 8, 30, 0.5], ['fondo', 5, 20, 0.5], ['cocina', 3, 8, 0.5], ['ventana', 1, 5, 0.1], ['alturaRiel', 2.2, 4, 0.1],
   ['filas', 1, 4, 1], ['columnas', 1, 8, 1], ['mesa', 0.6, 2, 0.1]])
   gui.add(P, k, a, b, s).onChange(build);
-gui.add(P, 'paso', 0.5, 2, 0.1).name('paso enganches (m)').onChange(build);
-gui.add(P, 'vCadena', 0.05, 0.6, 0.01).name('cadena (m/s)').onChange(physics);
+gui.add(P, 'paso', 0.4572, 1.9812, 0.1524).name('paso enganches (m)').onChange(build); // de 3 a 13 pasos de 152,4 mm
+gui.add(P, 'vCadena', 0.05, 0.6, 0.01).name('cadena (m/s)').onChange(build); // cambia cuándo arranca cada rotor
 gui.add(P, 'mCarro', 1, 8, 0.5).name('carro + plato (kg)').onChange(physics);
 gui.add(P, 'mCadena', 0.5, 5, 0.1).name('cadena (kg/m)').onChange(physics);
 gui.add(P, 'friccion', 0.01, 0.08, 0.005).name('fricción rodadura').onChange(physics);
@@ -455,8 +462,9 @@ gui.add(P, 'grabar video');
 const fis = gui.addFolder('Física calculada');
 for (const k in OUT) fis.add(OUT, k).disable().listen();
 // las medidas se quedan guardadas en el navegador entre recargas
-try { gui.load(JSON.parse(localStorage.getItem('maqueta'))); } catch {}
-gui.onFinishChange(() => localStorage.setItem('maqueta', JSON.stringify(gui.save())));
+// (clave v2: los valores por defecto pasaron a ser de catálogo y lo guardado con la clave anterior los taparía)
+try { gui.load(JSON.parse(localStorage.getItem('maqueta-v2'))); } catch {}
+gui.onFinishChange(() => localStorage.setItem('maqueta-v2', JSON.stringify(gui.save())));
 
 function resize() {
   renderer.setSize(innerWidth, innerHeight);
