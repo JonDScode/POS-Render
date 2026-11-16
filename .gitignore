@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+# diseño de piezas: este repo es público (GitHub Pages), el CAD y su visor se quedan en local
+cad/
+rotor.html

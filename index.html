@@ -22,17 +22,29 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 
-// ---- parámetros (metros) ----
+// ---- parámetros: medidas en metros, masas en kg, velocidades en m/s ----
 const P = {
   ancho: 15, fondo: 12, cocina: 3, ventana: 2.4, alturaRiel: 2.6,
   filas: 3, columnas: 4, mesa: 1.1,
-  velocidad: 2.5,
+  paso: 1.0, vCadena: 0.3, mCarro: 3, mCadena: 2, friccion: 0.03, rapidez: 5,
   duracion: 15, 'grabar video': record,
 };
+// resultados de física que el panel muestra (los rellena physics())
+const OUT = { 'longitud cadena (m)': '', 'enganches': '', 'masa en movimiento (kg)': '', 'tiro de cadena (N)': '', 'motor sugerido (W)': '',
+  'vuelta completa (s)': '', 'rotor (rpm)': '', 'media vuelta rotor (s)': '', 'par en eje rotor (N·m)': '', 'holgura entre rotores (m)': '',
+  'bandeja viaja a (m)': '', 'bajada del plato (m)': '', 'placa del rotor a (m)': '', 'cocina: platos/h por estación': '' };
 const hint = document.getElementById('hint');
 
-const SKIN = 0xffd500, RAIL = 0x444b55, FLOOR = 0xe4cd9e;
+const SKIN = 0xffd500, RAIL = 0x444b55, FLOOR = 0xe4cd9e, TEAL = 0x1d9e75;
 const COLORS = [0xc91a09, 0x0055bf, 0x237841, 0xfe8a18, 0x078bc9, 0x923978, 0xf4f4f4, 0x1b2a34];
+// RC: radio de las curvas de la cadena · VZ: velocidad de bajada del brazo · WFAST: giro del rotor en vacío (rad/s)
+const RC = 0.5, VZ = 0.25, WFAST = 1;
+// cotas que salen del CAD (cad/rotor.py y cad/carro.py), en metros y kg: si cambian allí, se cambian aquí
+// PIN: riel → pasador superior del carro · IZADO: lo que sube el carro al pasar al gancho · TRAY: pasador → base de la bandeja
+// PLATE: riel → placa de techo del rotor · M_PUNTA: plataforma + polipasto en la punta del brazo
+const PIN = 0.136, IZADO = 0.02, TRAY = 0.357, PLATE = 0.1935, M_PUNTA = 3.84;
+// AK: brazo de los rotores de cocina · T_CARGA: segundos que el carro pasa en el mesón mientras lo cargan o lo vacían
+const AK = 0.5, T_CARGA = 6;
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -55,7 +67,8 @@ controls.target.set(0, 1, 0);
 controls.maxPolarAngle = Math.PI / 2 - 0.05;
 
 // ---- helpers de piezas ----
-let world, tables, carts, L, queue, trunkBusy;
+let world, tables, rotors, carriers, slots, slotMesh, chain, L;
+const m4 = new THREE.Matrix4();
 const mats = {};
 const mat = c => mats[c] ??= new THREE.MeshStandardMaterial({ color: c, roughness: 0.35 });
 function add(geo, c, x, y, z, parent = world) {
@@ -67,18 +80,8 @@ function add(geo, c, x, y, z, parent = world) {
 }
 const box = (w, h, d, c, x, y, z, p) => add(new THREE.BoxGeometry(w, h, d), c, x, y, z, p);
 const cyl = (r, h, c, x, y, z, p) => add(new THREE.CylinderGeometry(r, r, h, 20), c, x, y, z, p);
-// paredes del túnel translúcidas para seguir la comida desde cualquier ángulo; opacity: 1 las deja opacas
-const TUNNEL = 0xcfd6dd, GLASS = new THREE.MeshStandardMaterial({ color: 0x9fd3ff, transparent: true, opacity: 0.35, roughness: 0.1, depthWrite: false });
-const pane = (w, h, d, x, y, z) => { const m = box(w, h, d, TUNNEL, x, y, z); m.material = GLASS; m.castShadow = false; };
-function spans(a, b, cuts, half) { // tramos de [a, b] que quedan al abrir un hueco de ±half en cada corte
-  const out = []; let s = a;
-  for (const c of [...cuts].sort((p, q) => p - q)) { if (c - half > s) out.push([s, c - half]); s = Math.max(s, c + half); }
-  if (b > s) out.push([s, b]);
-  return out;
-}
-console.assert(JSON.stringify(spans(0, 10, [5, 1], 1)) === '[[2,4],[6,10]]', 'spans');
-const v3 = (x, z) => new THREE.Vector3(x, 0, z);
-const ease = t => { t = Math.min(1, Math.max(0, t)); return t * t * (3 - 2 * t); };
+const GLASS = new THREE.MeshStandardMaterial({ color: 0x9fd3ff, transparent: true, opacity: 0.35, roughness: 0.1, depthWrite: false });
+const rect = (p, z0, y0, z1, y1) => { p.moveTo(z0, y0); p.lineTo(z1, y0); p.lineTo(z1, y1); p.lineTo(z0, y1); p.lineTo(z0, y0); return p; };
 function rng(seed) { // mulberry32: la decoración no cambia al mover un slider
   return () => { let t = seed += 0x6D2B79F5; t = Math.imul(t ^ t >>> 15, t | 1); t ^= t + Math.imul(t ^ t >>> 7, t | 61); return ((t ^ t >>> 14) >>> 0) / 4294967296; };
 }
@@ -108,10 +111,12 @@ function minifig(rnd, seated, chef) {
   return g;
 }
 
-function dish(rnd, parent) {
+function dish(rnd, parent) { // children: [0] plato, [1] comida, [2] campana que conserva el calor
   const g = new THREE.Group(); parent.add(g);
-  cyl(0.14, 0.02, 0xffffff, 0, 0.03, 0, g);
-  add(new THREE.SphereGeometry(0.09, 12, 8), pick(rnd, [0xc91a09, 0x237841, 0xfe8a18, 0x8b5a2b]), 0, 0.05, 0, g).scale.y = 0.6;
+  cyl(0.125, 0.02, 0xffffff, 0, 0.03, 0, g);
+  add(new THREE.SphereGeometry(0.08, 12, 8), pick(rnd, [0xc91a09, 0x237841, 0xfe8a18, 0x8b5a2b]), 0, 0.05, 0, g).scale.y = 0.6;
+  const dome = add(new THREE.SphereGeometry(0.14, 16, 8, 0, 2 * Math.PI, 0, Math.PI / 2), 0xffffff, 0, 0.03, 0, g); // cabe bajo el asa
+  dome.material = GLASS; dome.castShadow = false;
   return g;
 }
 
@@ -128,6 +133,21 @@ function label(n) {
   return s;
 }
 
+// ---- cadena: rectángulo de esquinas redondeadas recorrido en metros (s) ----
+function chainPos(s) { // s → [x, z]
+  s = ((s % chain.len) + chain.len) % chain.len;
+  for (const g of chain.segs) {
+    if (s < g.len) {
+      if (g.c) { const al = g.a0 + s / RC; return [g.c[0] + RC * Math.cos(al), g.c[1] + RC * Math.sin(al)]; }
+      const f = s / g.len; return [g.p[0] + (g.q[0] - g.p[0]) * f, g.p[1] + (g.q[1] - g.p[1]) * f];
+    }
+    s -= g.len;
+  }
+  return chain.segs[0].p;
+}
+const slotS = k => (chain.s + k * chain.pitch) % chain.len; // dónde va ahora el enganche k
+class ChainCurve extends THREE.Curve { getPoint(t, o = new THREE.Vector3()) { const [x, z] = chainPos(t * chain.len); return o.set(x, L.H, z); } }
+
 // ---- construir toda la maqueta desde P ----
 function build() {
   if (world) {
@@ -135,44 +155,100 @@ function build() {
     world.traverse(o => { if (o.isMesh) o.geometry.dispose(); if (o.isSprite) { o.material.map.dispose(); o.material.dispose(); } });
   }
   world = new THREE.Group(); scene.add(world);
-  const rnd = rng(7);
-  const W = P.ancho, D = P.fondo, H = P.alturaRiel, K = Math.min(P.cocina, W - 5);
-  const trunkX = -W / 2 + K, wallH = H + 0.6; // trunkX: x del riel troncal y del punto de carga, justo delante del muro de la cocina
-  const dz = D / P.filas, rowZ = Array.from({ length: P.filas }, (_, r) => -D / 2 + dz * (r + 0.5));
+  const rnd = rng(7), hp = Math.PI / 2;
+  const W = P.ancho, D = P.fondo, H = P.alturaRiel, K = Math.min(Math.max(P.cocina, 3), W - 5);
+  const wallX = -W / 2 + K, wallH = H + 0.6; // wallX: muro que separa cocina y sala
+  const rows = Math.min(P.filas, 4, Math.floor(D / 1.8)); // un solo óvalo atiende como mucho 4 filas: dos por tramo recto
+  const dz = D / rows, rowZ = Array.from({ length: rows }, (_, r) => -D / 2 + dz * (r + 0.5));
+  const zr = Math.max(RC, [D / 6, D / 8, D / 6, D / 4][rows - 1]); // los tramos rectos van en z = ±zr, a media distancia de las filas que atienden
+  L = { H };
 
-  // suelo, paredes (solo dos, para ver dentro) y tetones
+  // suelo, paredes exteriores (solo dos, para ver dentro) y tetones
   box(W, 0.2, D, FLOOR, 0, -0.1, 0);
-  box(K - 0.33, 0.02, D, 0xd9dde2, -W / 2 + (K - 0.33) / 2, 0.01, 0);
+  box(K, 0.02, D, 0xd9dde2, -W / 2 + K / 2, 0.01, 0);
   box(W + 0.2, wallH, 0.2, 0xf4f4f4, -0.1, wallH / 2, -D / 2 - 0.1);
   box(0.2, wallH, D, 0xf4f4f4, -W / 2 - 0.1, wallH / 2, 0);
   const nx = Math.floor((W - K) / 0.5), nz = Math.floor(D / 0.5);
   const studs = new THREE.InstancedMesh(new THREE.CylinderGeometry(0.09, 0.09, 0.05, 12), mat(FLOOR), nx * nz);
-  const m4 = new THREE.Matrix4();
   for (let i = 0; i < nx; i++) for (let j = 0; j < nz; j++)
-    studs.setMatrixAt(i * nz + j, m4.makeTranslation(trunkX + 0.25 + i * 0.5, 0.025, -D / 2 + 0.25 + j * 0.5));
+    studs.setMatrixAt(i * nz + j, m4.makeTranslation(wallX + 0.25 + i * 0.5, 0.025, -D / 2 + 0.25 + j * 0.5));
   studs.receiveShadow = true; world.add(studs);
 
-  // cocina cerrada: muro con una sola ventana de pase (4 cajas alrededor del hueco); la repisa atraviesa la ventana y ahí cargan las canastas
-  const wallX = trunkX - 0.4, win = Math.min(P.ventana, D - 1), side = (D - win) / 2;
-  for (const s of [-1, 1]) box(0.15, wallH, side, 0xf4f4f4, wallX, wallH / 2, s * (win + side) / 2);
-  box(0.15, 1.0, win, 0xf4f4f4, wallX, 0.5, 0);
-  box(0.15, wallH - 1.9, win, 0xf4f4f4, wallX, (wallH + 1.9) / 2, 0);
-  box(1.0, 0.08, win, 0xc91a09, trunkX - 0.2, 0.96, 0);
+  // cocina cerrada: muro extruido con huecos = una ventana para ver al chef + dos bocas altas por donde pasa la cadena
+  const win = Math.min(P.ventana, D - 2 * zr - 0.4), winTop = Math.min(1.9, H - 0.9);
+  const wall = rect(new THREE.Shape(), -D / 2, 0, D / 2, wallH);
+  wall.holes.push(rect(new THREE.Path(), -zr - win / 2, 1.0, -zr + win / 2, winTop));
+  for (const z of [-zr, zr]) wall.holes.push(rect(new THREE.Path(), z - 0.35, H - 0.75, z + 0.35, H + 0.15));
+  add(new THREE.ExtrudeGeometry(wall, { depth: 0.15, bevelEnabled: false }), 0xf4f4f4, wallX + 0.075, 0, 0).rotation.y = -Math.PI / 2;
   box(0.8, 0.9, Math.min(D - 2, 4), 0x8a9099, -W / 2 + 0.5, 0.45, 0);
   for (const z of [-1, 0, 1]) cyl(0.15, 0.03, 0x222222, -W / 2 + 0.5, 0.915, z);
-  for (const z of [-win / 4, win / 4]) {
+  // dos estaciones de cocina, por fuera del óvalo y a 2·AK de la cadena: un rotor les baja el carro al mesón
+  const xS = wallX - 0.9, zK = zr + 2 * AK;
+  box(0.7, 0.9, 0.7, 0xc91a09, xS, 0.45, -zK); // mesón rojo, tramo de ida: aquí se carga el plato en el carro
+  box(0.7, 0.9, 0.7, 0x078bc9, xS, 0.45, zK);  // mesón azul, tramo de vuelta: aquí se retira el plato sucio
+  for (const z of [-zK, zK]) {
     const chef = minifig(rnd, false, true);
-    chef.position.x = wallX - 0.8; chef.position.z = z; chef.rotation.y = Math.PI / 2;
+    chef.position.x = xS - 0.8; chef.position.z = z; chef.rotation.y = hp;
     world.add(chef);
   }
 
-  // mesas numeradas
-  const x0 = trunkX + 1.5, x1 = W / 2 - 0.8, dx = (x1 - x0) / P.columnas;
+  // cadena sin fin: sale de la cocina por z = -zr (sentido +x), gira al fondo y vuelve por z = +zr
+  const xa = wallX - 1.9, xb = W / 2 - 0.6, La = xb - xa - 2 * RC, Lz = 2 * zr - 2 * RC;
+  chain = { s: 0, segs: [
+    { p: [xa + RC, -zr], q: [xb - RC, -zr], len: La },
+    { c: [xb - RC, -zr + RC], a0: -hp, len: hp * RC },
+    { p: [xb, -zr + RC], q: [xb, zr - RC], len: Lz },
+    { c: [xb - RC, zr - RC], a0: 0, len: hp * RC },
+    { p: [xb - RC, zr], q: [xa + RC, zr], len: La },
+    { c: [xa + RC, zr - RC], a0: hp, len: hp * RC },
+    { p: [xa, zr - RC], q: [xa, -zr + RC], len: Lz },
+    { c: [xa + RC, -zr + RC], a0: 2 * hp, len: hp * RC },
+  ] };
+  chain.len = chain.segs.reduce((n, g) => n + g.len, 0);
+  const sOnA = x => x - xa - RC, sOnB = x => La + 2 * hp * RC + Lz + (xb - RC - x); // s de un punto del tramo de ida / de vuelta
+  const wrap = s => (s + chain.len) % chain.len;
+  add(new THREE.TubeGeometry(new ChainCurve(), 300, 0.03, 8, true), RAIL, 0, 0, 0);
+  for (const x of [xa, xb]) for (const z of [-zr, zr]) cyl(0.05, H, RAIL, x, H / 2, z);
+
+  // mesas numeradas, cada una con su rotor de desvío colgado entre la cadena y la mesa
+  const x0 = wallX + 1.0, x1 = xb - RC - 0.2, dx = (x1 - x0) / P.columnas;
   const S = Math.max(0.5, Math.min(P.mesa, dx - 0.4, dz - 0.4));
-  tables = [];
+  L.dx = dx;
+  tables = []; rotors = [];
+  // rotor de desvío (cotas de cad/rotor.py) colgado entre el tramo de cadena zrun y el punto (x, z) donde deja la bandeja, a la altura `top`
+  // Fijos: viga de techo, placa, carcasa y eje. Giran: brazo, polipasto y plataforma con el gancho
+  function addRotor(x, z, zrun, kind, table, top) {
+    // u: hacia qué lado queda la cadena · dir: sentido de la cadena · a: largo del brazo
+    const u = Math.sign(zrun - z), dir = zrun < 0 ? 1 : -1, a = Math.abs(zrun - z) / 2, cz = (z + zrun) / 2;
+    const yP = H + PLATE, DARK = 0x3f444c;
+    box(0.06, 0.06, a, RAIL, x, yP + 0.038, (cz + zrun) / 2);
+    cyl(0.02, PLATE + 0.038, RAIL, x, H + (PLATE + 0.038) / 2, zrun); // tirante del que cuelga el riel
+    box(0.2, 0.008, 0.2, RAIL, x, yP + 0.004, cz);
+    cyl(0.06, 0.15, DARK, x, yP - 0.075, cz);
+    cyl(0.02, 0.07, RAIL, x, yP - 0.185, cz);
+    const arm = new THREE.Group(); arm.position.set(x, yP - 0.25, cz); world.add(arm);
+    box(a + 0.07, 0.06, 0.04, TEAL, a / 2 - 0.085, 0, 0, arm);              // el tubo acaba 5 cm antes de la cadena
+    cyl(0.02, 0.08, DARK, a - 0.34, -0.06, 0, arm).rotation.x = hp;         // tambor
+    cyl(0.015, 0.08, DARK, a - 0.085, -0.055, 0, arm).rotation.x = hp;      // reenvío
+    box(0.06, 0.06, 0.1, DARK, a - 0.34, -0.06, 0.09, arm);                 // motorreductor
+    const plat = new THREE.Group(); arm.add(plat);                          // plataforma: baja colgada de las 4 cintas
+    box(0.385, 0.016, 0.07, TEAL, a - 0.1475, 0, 0, plat);                  // placa con el gancho en la punta
+    box(0.06, 0.03, 0.07, RAIL, a - 0.31, -0.023, 0, plat);                 // contrapeso
+    for (const gx of [a - 0.14, a - 0.25]) cyl(0.006, 0.1, RAIL, gx, 0.058, 0, plat); // columnas guía
+    const belts = [a - 0.32, a - 0.07].flatMap(bx => [-0.03, 0.03].map(bz => box(0.002, 1, 0.01, 0xf2cd37, bx, 0, bz, arm)));
+    // beta0: ángulo del brazo al tocar la cadena · sigma: sentido de giro para que el gancho vaya con la cadena
+    // sGo / sBack: por dónde debe ir el enganche cuando el rotor arranca para tomar (1/4 de vuelta) o devolver (1/2 vuelta)
+    const sPick = zrun < 0 ? sOnA(x) : sOnB(x);
+    const r = { kind, table, cx: x, cz, a, arm, plat, belts, beta0: u * hp, sigma: -u * dir, sPick,
+      sGo: wrap(sPick - a * hp), sBack: wrap(sPick - a * Math.PI), depth: H - PIN + IZADO - TRAY - top, // depth: cuánto baja el polipasto
+      psi: 0, drop: 0, timer: 0, state: 'idle', carrier: null, k: 0 };
+    rotors.push(r);
+    return r;
+  }
   for (const z of rowZ) {
+    const zrun = z <= 0 ? -zr : zr, u = Math.sign(zrun - z); // zrun: tramo que atiende a esta fila · u: hacia qué lado queda la cadena
     for (let c = 0; c < P.columnas; c++) {
-      const x = x0 + dx * (c + 0.5);
+      const x = x0 + dx * (c + (u > 0 ? 0.25 : 0.75)); // filas a ambos lados de un tramo van al tresbolillo: no comparten punto de toma
       box(S, 0.08, S, 0xf4f4f4, x, 0.75, z);
       cyl(0.08, 0.71, RAIL, x, 0.355, z);
       cyl(0.015, 0.3, RAIL, x - S / 2 + 0.06, 0.94, z + S / 2 - 0.06);
@@ -189,116 +265,170 @@ function build() {
         box(0.5, 0.5, 0.08, 0x0055bf, 0, 0.7, -0.29, seat);
         if (rnd() < 0.75) seat.add(minifig(rnd, true));
       }
-      const plate = dish(rnd, world); plate.position.set(x, 0.79, z); plate.visible = false;
-      tables.push({ x, z, plate });
+      const t = { x, z, state: 'idle', timer: 0.1 + rnd() * 30 }; // piden a destiempo
+      tables.push(t);
+      t.rotor = addRotor(x, z, zrun, 'mesa', t, 0.79); // tablero de la mesa a 0,79
     }
   }
+  // cocina: dos rotores cortos, iguales a los de las mesas, bajan el carro a un mesón para cargarlo o vaciarlo parado
+  L.load = addRotor(xS, -zK, -zr, 'carga', null, 0.9);
+  L.unload = addRotor(xS, zK, zr, 'descarga', null, 0.9);
 
-  // rieles: troncal (eje z) pegado a la cocina + un ramal (eje x) por fila de mesas
-  const zmin = Math.min(...rowZ, 0) - 0.4, zmax = Math.max(...rowZ, 0) + 0.4, xEnd = x1 - dx / 2 + 0.4;
-  box(0.1, 0.1, zmax - zmin, RAIL, trunkX, H, (zmin + zmax) / 2);
-  for (const z of [zmin, zmax]) cyl(0.05, H, RAIL, trunkX, H / 2, z);
-  for (const z of rowZ) {
-    box(xEnd - trunkX, 0.1, 0.1, RAIL, (trunkX + xEnd) / 2, H, z);
-    cyl(0.05, H, RAIL, xEnd, H / 2, z);
-  }
-
-  // túnel térmico: canal en U alrededor del riel, abierto por arriba, con hueco en el suelo solo donde baja la canasta
-  const fy = H - 0.58, wy = H - 0.25, colX = tables.slice(0, P.columnas).map(t => t.x);
-  for (const [a, b] of spans(zmin, zmax, [0], 0.3)) box(0.6, 0.04, b - a, TUNNEL, trunkX, fy, (a + b) / 2);
-  pane(0.03, 0.7, zmax - zmin, trunkX - 0.3, wy, (zmin + zmax) / 2);
-  for (const [a, b] of spans(zmin, zmax, rowZ, 0.3)) pane(0.03, 0.7, b - a, trunkX + 0.3, wy, (a + b) / 2); // bocas hacia los ramales
-  for (const z of [zmin, zmax]) pane(0.6, 0.7, 0.03, trunkX, wy, z);
-  for (const z of rowZ) {
-    for (const [a, b] of spans(trunkX + 0.3, xEnd, colX, 0.3)) box(b - a, 0.04, 0.6, TUNNEL, (a + b) / 2, fy, z);
-    for (const s of [-1, 1]) pane(xEnd - trunkX - 0.3, 0.7, 0.03, (trunkX + 0.3 + xEnd) / 2, wy, z + s * 0.3);
-    pane(0.03, 0.7, 0.6, xEnd, wy, z);
-  }
-
-  // un carrito por fila, aparcado dentro de su ramal, con canasta colgada de un cable
-  L = { H, trunkX, home: v3(trunkX, 0) };
-  carts = []; queue = []; trunkBusy = false;
-  rowZ.forEach((z, r) => {
+  // enganches de la cadena (uno cada `paso`) y tantos carros como mesas, repartidos por la cadena
+  const N = Math.max(tables.length, Math.round(chain.len / P.paso));
+  chain.pitch = chain.len / N;
+  slots = Array.from({ length: N }, () => ({ carrier: null, reserved: false }));
+  slotMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.05, 0.15, 0.05), mat(0xf2cd37), N); // estribos que cuelgan del riel
+  world.add(slotMesh);
+  carriers = tables.map((_, i) => {
+    // carro (cotas de cad/carro.py), con el origen en su pasador superior: varilla con dos pasadores, asa y bandeja
     const g = new THREE.Group(); world.add(g);
-    box(0.3, 0.14, 0.3, 0xf2cd37, 0, H - 0.12, 0, g);
-    const cable = cyl(0.012, 1, 0x222222, 0, 0, 0, g);
-    const basket = new THREE.Group(); g.add(basket);
-    box(0.4, 0.03, 0.4, 0xfe8a18, 0, 0, 0, basket);
-    for (const [w, d, x, z] of [[0.4, 0.03, 0, 0.185], [0.4, 0.03, 0, -0.185], [0.03, 0.4, 0.185, 0], [0.03, 0.4, -0.185, 0]])
-      box(w, 0.14, d, 0xfe8a18, x, 0.07, z, basket);
-    const c = { g, cable, basket, food: dish(rnd, basket), phase: 'wait', park: v3(trunkX + 0.8, z),
-      tables: tables.slice(r * P.columnas, (r + 1) * P.columnas) };
-    g.position.copy(c.park); c.food.visible = false; setDrop(c, 0);
-    carts.push(c); queue.push(c);
+    const INOX = 0xc0c4cc, NAR = 0xfe8a18;
+    cyl(0.006, 0.156, INOX, 0, -0.072, 0, g);
+    for (const y of [0, -0.09]) cyl(0.006, 0.08, INOX, 0, y, 0, g).rotation.z = hp; // pasadores: a lo largo de x local
+    box(0.025, 0.005, 0.296, NAR, 0, -0.1525, 0, g);
+    for (const z of [-0.1455, 0.1455]) box(0.025, 0.2, 0.005, NAR, 0, -0.255, z, g);
+    box(0.3, 0.002, 0.3, NAR, 0, -TRAY + 0.001, 0, g);
+    for (const [w, d, x, z] of [[0.3, 0.002, 0, 0.149], [0.3, 0.002, 0, -0.149], [0.002, 0.3, 0.149, 0], [0.002, 0.3, -0.149, 0]])
+      box(w, 0.015, d, NAR, x, -TRAY + 0.0075, z, g);
+    const car = { g, dish: dish(rnd, g), table: null };
+    car.dish.position.y = -TRAY - 0.018; // el plato apoya en el fondo de la bandeja
+    setCarrier(car, 'free');
+    slots[Math.floor(i * N / tables.length)].carrier = car;
+    return car;
   });
 
   const R = Math.max(W, D);
   sun.position.set(W * 0.3, 14, D * 0.8);
   Object.assign(sun.shadow.camera, { left: -R, right: R, top: R, bottom: -R, near: 1, far: 50 });
   sun.shadow.camera.updateProjectionMatrix();
+  physics();
 }
 
-// ---- animación: esperar turno → ir a la ventana → cargar → servir en su fila → volver a su ramal ----
-// Cada carrito solo sirve su fila, así que en los ramales nunca se cruzan. El troncal y la ventana son el único
-// tramo compartido: lo usa un carrito a la vez (trunkBusy) y `queue` reparte el turno por orden de llegada.
-function setDrop(c, y) {
-  const by = L.H - 0.5 - y, top = L.H - 0.19, len = top - (by + 0.14);
-  c.basket.position.y = by;
-  c.cable.scale.y = len;
-  c.cable.position.y = top - len / 2;
+// ---- física de primer orden (dimensionado, no dinámica) ----
+const pull = (M, mu, turns = 4) => mu * M * 9.81 * 1.04 ** turns; // tiro = rodadura de toda la masa colgada + ~4 % por cada curva de 90°
+console.assert(Math.abs(pull(150, 0.03, 0) - 44.1) < 0.1, 'pull');
+function physics() {
+  if (!chain) return;
+  const v = P.vCadena, a = rotors[0].a, M = carriers.length * P.mCarro + chain.len * P.mCadena, F = pull(M, P.friccion);
+  Object.assign(OUT, {
+    'longitud cadena (m)': chain.len.toFixed(1),
+    'enganches': slots.length + ' cada ' + chain.pitch.toFixed(2) + ' m',
+    'masa en movimiento (kg)': M.toFixed(0),
+    'tiro de cadena (N)': F.toFixed(0),
+    'motor sugerido (W)': (2 * F * v / 0.7).toFixed(0),          // rendimiento 0,7 y margen ×2
+    'vuelta completa (s)': (chain.len / v).toFixed(0),
+    'rotor (rpm)': (v / a * 60 / (2 * Math.PI)).toFixed(1),       // el gancho debe ir a la velocidad de la cadena: ω = v / a
+    'media vuelta rotor (s)': (Math.PI * a / v).toFixed(1),
+    'par en eje rotor (N·m)': (((P.mCarro + M_PUNTA) * a + 0.76 * a * a) * 9.81).toFixed(0), // carro + plataforma + polipasto en la punta, y el tubo (1,52 kg/m)
+    'holgura entre rotores (m)': (L.dx - 2 * a - 0.33).toFixed(2), // negativa = dos bandejas vecinas se tocarían al girar
+    'bandeja viaja a (m)': (L.H - PIN - TRAY).toFixed(2),          // por debajo de 2 m pasaría a la altura de las cabezas
+    'bajada del plato (m)': rotors[0].depth.toFixed(2),            // recorrido que necesita el polipasto
+    'placa del rotor a (m)': (L.H + PLATE).toFixed(2),             // altura libre mínima del local
+    // ciclo de un rotor de cocina: media vuelta de ida y otra de vuelta al paso de la cadena, bajar y subir, la carga,
+    // volver vacío a su espera y, de media, un enganche hasta que pasa un hueco libre
+    'cocina: platos/h por estación': (3600 / (2 * Math.PI * AK / v + 2 * L.load.depth / VZ + T_CARGA + 1.5 * Math.PI / WFAST + chain.pitch / v)).toFixed(0),
+  });
 }
-function next(c) {
-  c.t = 0; c.i = 0; c.done = false; c.path = null;
-  const junction = v3(L.trunkX, c.park.z);
-  if (c.phase === 'wait') { // le toca: ocupa el troncal y va a la ventana
-    trunkBusy = true;
-    c.table = c.tables[Math.floor(Math.random() * c.tables.length)];
-    c.table.plate.visible = false; c.food.visible = false;
-    c.phase = 'toHome'; c.path = [junction, L.home];
-  } else if (c.phase === 'toHome') {
-    c.phase = 'load'; c.depth = L.H - 1.53;
-  } else if (c.phase === 'load') {
-    c.phase = 'go'; c.path = [junction, c.park, v3(c.table.x, c.table.z)];
-  } else if (c.phase === 'go') {
-    c.phase = 'serve'; c.depth = L.H - 1.31;
-  } else if (c.phase === 'serve') {
-    c.phase = 'back'; c.path = [c.park];
-  } else {
-    c.phase = 'wait'; queue.push(c);
-  }
-  setDrop(c, 0);
+
+// ---- simulación cinemática ----
+// La cadena nunca para. Un carro: free (vacío) → food (cargado en el mesón rojo, con campana) → served (en la mesa) → dirty (plato sucio) → free (vaciado en el mesón azul).
+// Los tres cambios de estado ocurren con el carro parado y apoyado, bajado por un rotor: en su mesa o en un mesón de cocina.
+// Un rotor: idle → meet (gira sincronizado hasta tomar el carro) → swing → lower → table → raise → ready (espera hueco) → return → park → idle.
+function setCarrier(c, state) {
+  c.state = state;
+  c.dish.visible = state !== 'free';
+  c.dish.children[1].visible = state === 'food' || state === 'served';
+  c.dish.children[2].visible = state === 'food';
 }
-function stepCart(c, dt) {
-  const v = P.velocidad;
-  if (c.phase === 'wait') { if (!trunkBusy && queue[0] === c) { queue.shift(); next(c); } return; }
-  if (c.path) {
-    const d = c.path[c.i].clone().sub(c.g.position), step = v * dt;
-    if (d.length() <= step) {
-      c.g.position.copy(c.path[c.i]);
-      if (c.phase === 'go' && c.path[c.i] === c.park) trunkBusy = false; // ya entró en su ramal: libera el troncal
-      if (++c.i >= c.path.length) next(c);
-    } else c.g.position.add(d.setLength(step));
-    return;
+function setDrop(r) { // la plataforma baja r.drop y las cintas se alargan del tambor a la placa
+  const len = 0.09 + r.drop;
+  r.plat.position.y = -0.158 - r.drop;
+  for (const b of r.belts) { b.scale.y = len; b.position.y = -0.06 - len / 2; }
+}
+function step(dt) {
+  const ds = P.vCadena * dt, len = chain.len;
+  slots.forEach((sl, k) => {
+    const s0 = slotS(k), crosses = p => (p - s0 + len) % len < ds, c = sl.carrier; // ¿este enganche pasa por p en este paso?
+    if (c) {
+      // a cada carro lo toma un rotor: el de su mesa si lleva comida, el de descarga si vuelve sucio, el de carga si va vacío y hay pedido
+      const r = c.state === 'food' ? c.table.rotor : c.state === 'dirty' ? L.unload : L.load;
+      if (r.state === 'idle' && crosses(r.sGo)) { // si el rotor está ocupado, el carro da otra vuelta
+        const t = c.state === 'free' && tables.find(t => t.state === 'hungry');
+        if (t) { t.state = 'assigned'; c.table = t; }
+        if (t || c.state !== 'free') Object.assign(r, { state: 'meet', k });
+      }
+    } else if (!sl.reserved) {
+      const r = rotors.find(r => r.state === 'ready' && crosses(r.sBack)); // hueco libre para un rotor que quiere devolver su carro
+      if (r) { sl.reserved = true; Object.assign(r, { state: 'return', k }); }
+    }
+  });
+  chain.s = (chain.s + ds) % len;
+  for (const t of tables) if (t.state === 'idle' && (t.timer -= dt) <= 0) t.state = 'hungry';
+  for (const r of rotors) stepRotor(r, dt);
+}
+function stepRotor(r, dt) {
+  const t = r.table, PI = Math.PI;
+  const toPick = () => (r.sPick - slotS(r.k) + chain.len) % chain.len; // metros que le faltan al enganche para llegar al punto de toma
+  if (r.state === 'meet' || r.state === 'return') {
+    // leva electrónica: el ángulo va esclavo de la cadena, así gancho y enganche llegan a la vez y a la misma velocidad
+    const d = toPick(), at = r.state === 'meet' ? PI / 2 : 2.5 * PI;
+    if (d < chain.len / 2) r.psi = at - d / r.a;
+    else if (r.state === 'meet') { // toma: el carro pasa de la cadena al gancho
+      r.psi = at; r.carrier = slots[r.k].carrier; slots[r.k].carrier = null; r.state = 'swing';
+    } else {                       // devolución: el carro vuelve a la cadena con el plato sucio
+      r.psi = at; Object.assign(slots[r.k], { carrier: r.carrier, reserved: false }); r.carrier = null; r.state = 'park';
+      if (t) Object.assign(t, { state: 'idle', timer: 15 + Math.random() * 25 });
+    }
+  } else if (r.state === 'swing') { // media vuelta hasta quedar sobre la mesa
+    r.psi = Math.min(r.psi + P.vCadena / r.a * dt, 1.5 * PI);
+    if (r.psi === 1.5 * PI) r.state = 'lower';
+  } else if (r.state === 'lower') {
+    r.drop = Math.min(r.drop + VZ * dt, r.depth);
+    if (r.drop === r.depth) {
+      r.state = 'table'; r.timer = t ? 20 + Math.random() * 20 : T_CARGA;
+      if (t) { setCarrier(r.carrier, 'served'); t.state = 'eating'; }
+    }
+  } else if (r.state === 'table') { // en la mesa la bandeja se queda mientras comen; en cocina, lo que tarda el cocinero
+    if ((r.timer -= dt) <= 0) { setCarrier(r.carrier, { mesa: 'dirty', carga: 'food', descarga: 'free' }[r.kind]); r.state = 'raise'; }
+  } else if (r.state === 'raise') {
+    r.drop = Math.max(r.drop - VZ * dt, 0);
+    if (r.drop === 0) r.state = 'ready';
+  } else if (r.state === 'park') {  // sin carga puede girar rápido hasta su posición de espera
+    r.psi = Math.min(r.psi + WFAST * dt, 4 * PI);
+    if (r.psi === 4 * PI) { r.psi = 0; r.state = 'idle'; }
   }
-  c.t += dt;
-  const tDown = c.depth / (v * 0.5), hold = 0.8;
-  if (c.t > tDown && !c.done) { // tocó fondo: cargar o entregar el plato
-    c.done = true;
-    c.food.visible = c.phase === 'load';
-    if (c.phase === 'serve') c.table.plate.visible = true;
+}
+function draw() {
+  slots.forEach((sl, k) => {
+    const s = slotS(k), [x, z] = chainPos(s);
+    slotMesh.setMatrixAt(k, m4.makeTranslation(x, L.H - 0.075, z));
+    if (sl.carrier) {
+      const [x2, z2] = chainPos(s + 0.01);
+      sl.carrier.g.position.set(x, L.H - PIN, z);
+      sl.carrier.g.rotation.y = -Math.atan2(z2 - z, x2 - x); // colgado del estribo, los pasadores van a lo largo de la cadena
+    }
+  });
+  slotMesh.instanceMatrix.needsUpdate = true;
+  for (const r of rotors) {
+    const beta = r.beta0 + r.sigma * (r.psi - Math.PI / 2);
+    r.arm.rotation.y = -beta;
+    setDrop(r);
+    if (r.carrier) {
+      r.carrier.g.position.set(r.cx + r.a * Math.cos(beta), L.H - PIN + IZADO - r.drop, r.cz + r.a * Math.sin(beta));
+      r.carrier.g.rotation.y = -beta - Math.PI / 2; // en el gancho, los pasadores van perpendiculares al brazo
+    }
   }
-  if (c.t > 2 * tDown + hold) return next(c);
-  setDrop(c, c.depth * (c.t < tDown + hold ? ease(c.t / tDown) : 1 - ease((c.t - tDown - hold) / tDown)));
 }
 
 function record() { // MP4 (H.264) es lo que WhatsApp reproduce en el chat; WebM solo si el navegador no sabe codificar MP4
   const mime = ['video/mp4;codecs=avc1.42E01E', 'video/mp4', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
   // 5 Mbps: 25 s ≈ 15 MB, por debajo del límite clásico de 16 MB de WhatsApp
   const rec = new MediaRecorder(renderer.domElement.captureStream(30), { mimeType: mime, videoBitsPerSecond: 5e6 });
-  const chunks = [], tip = hint.textContent;
+  const chunks = [], tip = hint.innerHTML;
   rec.ondataavailable = e => chunks.push(e.data);
   rec.onstop = () => {
-    hint.textContent = tip;
+    hint.innerHTML = tip;
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(chunks, { type: mime }));
     a.download = 'restaurante.' + (mime.includes('mp4') ? 'mp4' : 'webm');
@@ -311,12 +441,19 @@ function record() { // MP4 (H.264) es lo que WhatsApp reproduce en el chat; WebM
 
 // ---- panel ----
 const gui = new GUI({ title: 'Medidas (m)' });
-for (const [k, a, b, s] of [['ancho', 8, 30, 0.5], ['fondo', 5, 20, 0.5], ['cocina', 2, 8, 0.5], ['ventana', 1, 5, 0.1], ['alturaRiel', 2.2, 4, 0.1],
-  ['filas', 1, 5, 1], ['columnas', 1, 8, 1], ['mesa', 0.6, 2, 0.1]])
+for (const [k, a, b, s] of [['ancho', 8, 30, 0.5], ['fondo', 5, 20, 0.5], ['cocina', 3, 8, 0.5], ['ventana', 1, 5, 0.1], ['alturaRiel', 2.2, 4, 0.1],
+  ['filas', 1, 4, 1], ['columnas', 1, 8, 1], ['mesa', 0.6, 2, 0.1]])
   gui.add(P, k, a, b, s).onChange(build);
-gui.add(P, 'velocidad', 0.5, 8, 0.1);
+gui.add(P, 'paso', 0.5, 2, 0.1).name('paso enganches (m)').onChange(build);
+gui.add(P, 'vCadena', 0.05, 0.6, 0.01).name('cadena (m/s)').onChange(physics);
+gui.add(P, 'mCarro', 1, 8, 0.5).name('carro + plato (kg)').onChange(physics);
+gui.add(P, 'mCadena', 0.5, 5, 0.1).name('cadena (kg/m)').onChange(physics);
+gui.add(P, 'friccion', 0.01, 0.08, 0.005).name('fricción rodadura').onChange(physics);
+gui.add(P, 'rapidez', 1, 20, 1).name('cámara rápida ×');
 gui.add(P, 'duracion', 5, 25, 1).name('duración vídeo (s)');
 gui.add(P, 'grabar video');
+const fis = gui.addFolder('Física calculada');
+for (const k in OUT) fis.add(OUT, k).disable().listen();
 // las medidas se quedan guardadas en el navegador entre recargas
 try { gui.load(JSON.parse(localStorage.getItem('maqueta'))); } catch {}
 gui.onFinishChange(() => localStorage.setItem('maqueta', JSON.stringify(gui.save())));
@@ -332,10 +469,12 @@ build();
 
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
-  const dt = Math.min(clock.getDelta(), 0.05);
-  for (const c of carts) stepCart(c, dt);
-  for (const a of carts) for (const b of carts) // chequeo: dos carritos nunca en el mismo sitio
-    console.assert(a === b || a.g.position.distanceTo(b.g.position) > 0.45, 'choque de carritos');
+  // tiempo simulado = tiempo real × cámara rápida, en pasos de 50 ms como mucho
+  const dt = Math.min(clock.getDelta(), 0.05) * P.rapidez, n = Math.ceil(dt / 0.05);
+  for (let i = 0; i < n; i++) step(dt / n);
+  draw();
+  // chequeo: ningún carro se pierde ni se duplica al pasar entre cadena y rotores
+  console.assert(slots.filter(s => s.carrier).length + rotors.filter(r => r.carrier).length === carriers.length, 'carro perdido o duplicado');
   controls.update();
   renderer.render(scene, camera);
 });
